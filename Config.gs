@@ -15,12 +15,42 @@ const Config = (() => {
   let settingsCache = null;
   let linksCache = null;
   let locationsCache = null;
+  const SCRIPT_CACHE = CacheService.getScriptCache();
+  const SETTINGS_CACHE_KEY = "PORTAL_CONFIG_V2";
+  const LINKS_CACHE_KEY = "PORTAL_LINKS_V2";
+  const LOCATIONS_CACHE_KEY = "PORTAL_LOCATIONS_V2";
+  const CACHE_SECONDS = 300;
+
+  function cacheRead(key) {
+    try {
+      const value = SCRIPT_CACHE.get(key);
+      return value ? JSON.parse(value) : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function cacheWrite(key, value) {
+    try {
+      const payload = JSON.stringify(value);
+      // CacheService accepts values smaller than 100 KB. Skip unusually large
+      // link tables instead of failing the request.
+      if (payload.length < 95000)
+        SCRIPT_CACHE.put(key, payload, CACHE_SECONDS);
+    } catch (error) {
+      // Configuration remains available from Sheets when cache is unavailable.
+    }
+    return value;
+  }
 
   /**
    * Load Configuration Sheet
    */
   function loadSettings() {
 
+    if (settingsCache) return settingsCache;
+
+    settingsCache = cacheRead(SETTINGS_CACHE_KEY);
     if (settingsCache) return settingsCache;
 
     const sheet = SpreadsheetApp
@@ -44,7 +74,7 @@ const Config = (() => {
 
     }
 
-    return settingsCache;
+    return cacheWrite(SETTINGS_CACHE_KEY, settingsCache);
 
   }
 
@@ -53,6 +83,9 @@ const Config = (() => {
    */
   function loadLinks() {
 
+    if (linksCache) return linksCache;
+
+    linksCache = cacheRead(LINKS_CACHE_KEY);
     if (linksCache) return linksCache;
 
     const sheet = SpreadsheetApp
@@ -66,7 +99,7 @@ const Config = (() => {
 
     linksCache = values.slice(1);
 
-    return linksCache;
+    return cacheWrite(LINKS_CACHE_KEY, linksCache);
 
   }
 
@@ -76,6 +109,9 @@ const Config = (() => {
    */
   function loadLocations() {
 
+    if (locationsCache) return locationsCache;
+
+    locationsCache = cacheRead(LOCATIONS_CACHE_KEY);
     if (locationsCache) return locationsCache;
 
     const sheet = SpreadsheetApp
@@ -120,7 +156,7 @@ const Config = (() => {
       return rows;
     }, []);
 
-    return locationsCache;
+    return cacheWrite(LOCATIONS_CACHE_KEY, locationsCache);
 
   }
    
@@ -175,8 +211,16 @@ const Config = (() => {
     if (value && typeof value.getContentUrl === "function")
       return value.getContentUrl();
 
-    // Safe fallback while B24 still contains a normal URL.
-    return configText(value);
+    // Safe fallback while B24 still contains a normal URL. Convert normal
+    // Drive share links to a browser-displayable thumbnail URL.
+    const raw = configText(value);
+    // Accept a Drive sharing URL, an open?id= URL, or a plain Drive file ID.
+    // The latter is the value most commonly pasted in Configuration.
+    const match = raw.match(/[?&]id=([A-Za-z0-9_-]+)/) || raw.match(/\/d\/([A-Za-z0-9_-]+)/);
+    const fileId = match ? match[1] : (/^[A-Za-z0-9_-]{15,}$/.test(raw) ? raw : '');
+    return fileId
+      ? 'https://drive.google.com/thumbnail?id=' + encodeURIComponent(fileId) + '&sz=w800'
+      : raw;
 
   }
 
@@ -238,6 +282,11 @@ const Config = (() => {
       settingsCache = null;
       linksCache = null;
       locationsCache = null;
+      SCRIPT_CACHE.removeAll([
+        SETTINGS_CACHE_KEY,
+        LINKS_CACHE_KEY,
+        LOCATIONS_CACHE_KEY
+      ]);
 
     }
 
