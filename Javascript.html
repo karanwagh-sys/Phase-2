@@ -52,6 +52,88 @@ const APP = {
 
 };
 
+const PORTAL_SESSION_KEY = "rtoSession";
+const PORTAL_SESSION_EXPIRY_KEY = "rtoSessionExpiresAt";
+const PORTAL_SESSION_DURATION_MS = 10 * 60 * 60 * 1000;
+const EXTERNAL_API_TIMEOUT_MS = 75000;
+const EXTERNAL_API_RETRY_DELAY_MS = 900;
+const EXTERNAL_API_MAX_CONCURRENT = 3;
+const pendingExternalReads = new Map();
+let activeExternalRequests = 0;
+const queuedExternalRequests = [];
+
+const EXTERNAL_READ_ACTIONS = new Set([
+    "externalBootstrap", "validateSession", "userManagementContext",
+    "managedUserAvailability", "attendanceMine", "attendanceDashboard",
+    "attendanceCalendar", "attendanceCorrectionRiders", "attendanceQueue", "attendanceWorkspace",
+    "attendanceApprovedKm", "attendanceCounts", "attendanceRepository",
+    "attendanceRiderOptions", "pendingQueueCount", "rosterList",
+    "myLeaveRequests", "leaveQueue", "mySubmissions", "getSubmission",
+    "dashboardCounts", "pendingRequests", "pendingLocationOptions", "pendingWorkspace", "navigationCounts",
+    "getReasons", "csrLocationOptions", "csrCallingAgents", "csrDashboard",
+    "csrAdminQueue", "csrAgentQueue", "getCsrTicket", "csrReasons",
+    "csrClosingOutcomes", "csrRepository", "adminDashboard", "notifications",
+    "unreadNotificationCount", "repositorySearch", "repositoryOrderHistory",
+    "appInfo"
+]);
+
+function readStoredPortalSession() {
+    try {
+        let sessionId = localStorage.getItem(PORTAL_SESSION_KEY) || "";
+        let expiresAt = Number(localStorage.getItem(PORTAL_SESSION_EXPIRY_KEY) || 0);
+
+        // One-time migration from the older tab-only storage. This is what
+        // previously lost the login when a mobile browser toggled Desktop site.
+        if (!sessionId) {
+            sessionId = sessionStorage.getItem(PORTAL_SESSION_KEY) || "";
+            if (sessionId) {
+                expiresAt = Date.now() + PORTAL_SESSION_DURATION_MS;
+                localStorage.setItem(PORTAL_SESSION_KEY, sessionId);
+                localStorage.setItem(PORTAL_SESSION_EXPIRY_KEY, String(expiresAt));
+            }
+        }
+
+        if (!sessionId) return null;
+        if (expiresAt && expiresAt <= Date.now()) {
+            clearStoredPortalSession();
+            return null;
+        }
+
+        // Older saved sessions did not have a browser expiry marker. The
+        // Apps Script server remains authoritative and will still enforce 10h.
+        if (!expiresAt) {
+            localStorage.setItem(
+                PORTAL_SESSION_EXPIRY_KEY,
+                String(Date.now() + PORTAL_SESSION_DURATION_MS)
+            );
+        }
+        return sessionId;
+    } catch (error) {
+        return sessionStorage.getItem(PORTAL_SESSION_KEY) || null;
+    }
+}
+
+function storePortalSession(sessionId) {
+    const value = String(sessionId || "").trim();
+    if (!value) return;
+    try {
+        localStorage.setItem(PORTAL_SESSION_KEY, value);
+        localStorage.setItem(
+            PORTAL_SESSION_EXPIRY_KEY,
+            String(Date.now() + PORTAL_SESSION_DURATION_MS)
+        );
+    } catch (error) {}
+    try { sessionStorage.setItem(PORTAL_SESSION_KEY, value); } catch (error) {}
+}
+
+function clearStoredPortalSession() {
+    try {
+        localStorage.removeItem(PORTAL_SESSION_KEY);
+        localStorage.removeItem(PORTAL_SESSION_EXPIRY_KEY);
+    } catch (error) {}
+    try { sessionStorage.removeItem(PORTAL_SESSION_KEY); } catch (error) {}
+}
+
 
 
 /* ==========================================================
@@ -68,13 +150,15 @@ document.addEventListener("DOMContentLoaded", initializeApplication);
 
 function initializeApplication(){
 
-    APP.session = sessionStorage.getItem("rtoSession") || null;
+    APP.session = readStoredPortalSession();
 
     applyAppBranding();
     initializeEvents();
     initializeCsrEvents();
     initializePasswordToggle();
-    validateSession();
+    if (APP.session) validateSession();
+    else showLogin();
+    if (window.__EXTERNAL_API__) void loadExternalBootConfig();
     loadRememberedUser();
     
 
@@ -546,6 +630,9 @@ function showPage(page, transitionClass) {
         csrReview: "csrReviewView",
         csrRepository: "csrRepositoryView",
         userManagement: "userManagementView"
+        ,attendance: "attendanceView"
+        ,regularization: "regularizationView"
+        ,roster: "rosterView"
     };
 
     const view = document.getElementById(pageMap[page]);
@@ -572,6 +659,27 @@ function showPage(page, transitionClass) {
 
 function server(functionName, ...args) {
 
+    if (window.__EXTERNAL_API__) {
+        const isRead = EXTERNAL_READ_ACTIONS.has(functionName);
+        const requestKey = isRead
+            ? JSON.stringify([functionName, APP.session || "", args])
+            : "";
+
+        if (isRead && pendingExternalReads.has(requestKey)) {
+            return pendingExternalReads.get(requestKey);
+        }
+
+        const request = externalApiRequest(functionName, args, isRead ? 1 : 0);
+        if (isRead) {
+            pendingExternalReads.set(requestKey, request);
+            request.then(
+                () => pendingExternalReads.delete(requestKey),
+                () => pendingExternalReads.delete(requestKey)
+            );
+        }
+        return request;
+    }
+
     return new Promise((resolve, reject) => {
 
         google.script.run
@@ -583,11 +691,106 @@ function server(functionName, ...args) {
 
 }
 
+function delay(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function acquireExternalRequestSlot() {
+    if (activeExternalRequests < EXTERNAL_API_MAX_CONCURRENT) {
+        activeExternalRequests += 1;
+        return Promise.resolve();
+    }
+    return new Promise(resolve => queuedExternalRequests.push(resolve));
+}
+
+function releaseExternalRequestSlot() {
+    const next = queuedExternalRequests.shift();
+    if (next) next();
+    else activeExternalRequests = Math.max(0, activeExternalRequests - 1);
+}
+
+async function externalApiRequest(functionName, args, retriesRemaining) {
+    await acquireExternalRequestSlot();
+    try {
+        return await performExternalApiRequest(functionName, args, retriesRemaining);
+    } finally {
+        releaseExternalRequestSlot();
+    }
+}
+
+async function performExternalApiRequest(functionName, args, retriesRemaining) {
+    const endpoint = window.EXTERNAL_API_URL || "/api";
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timeout = controller
+        ? setTimeout(() => controller.abort(), EXTERNAL_API_TIMEOUT_MS)
+        : null;
+
+    try {
+        const response = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                action: functionName,
+                sessionId: APP.session || "",
+                args: args
+            }),
+            signal: controller?.signal
+        });
+
+        const body = await response.json().catch(() => null);
+        if (!response.ok) {
+            const transient = [429, 502, 503, 504].includes(response.status);
+            if (transient && retriesRemaining > 0) {
+                if (timeout) clearTimeout(timeout);
+                await delay(EXTERNAL_API_RETRY_DELAY_MS);
+                return performExternalApiRequest(functionName, args, retriesRemaining - 1);
+            }
+            const responseError = new Error(
+                body?.message ||
+                (transient
+                    ? "The portal is taking longer than expected. Please try again."
+                    : "Unable to contact the portal service.")
+            );
+            responseError.noRetry = !transient;
+            throw responseError;
+        }
+        return body;
+    } catch (error) {
+        if (!error?.noRetry && retriesRemaining > 0) {
+            if (timeout) clearTimeout(timeout);
+            await delay(EXTERNAL_API_RETRY_DELAY_MS);
+            return performExternalApiRequest(functionName, args, retriesRemaining - 1);
+        }
+        if (error?.name === "AbortError") {
+            throw new Error("The data request timed out. Please try once more.");
+        }
+        throw new Error(error?.message || "The portal service is temporarily unavailable.");
+    } finally {
+        if (timeout) clearTimeout(timeout);
+    }
+}
+
+async function loadExternalBootConfig(){
+    try {
+        const response = await server("externalBootstrap");
+        if (!response?.success || !response.data) return;
+        window.APP_BOOT_CONFIG = Object.assign({}, window.APP_BOOT_CONFIG || {}, response.data);
+        applyAppBranding();
+    } catch (error) {
+        console.warn("Portal branding could not be refreshed.");
+    }
+}
+
 /* ==========================================================
    SESSION
 ========================================================== */
 
 async function validateSession(){
+
+    if (!APP.session) {
+        showLogin();
+        return;
+    }
 
     try{
 
@@ -604,15 +807,21 @@ async function validateSession(){
 
         }else{
 
-            sessionStorage.removeItem("rtoSession");
+            clearStoredPortalSession();
             showLogin();
 
         }
 
     }catch(error){
 
-        sessionStorage.removeItem("rtoSession");
+        // A temporary Sheets/Apps Script outage is not a logout. Preserve the
+        // still-valid token so reload or a mobile view-mode change can recover.
+        console.error(error);
         showLogin();
+        showToast(
+            "The portal could not restore your session yet. Please check your connection and retry.",
+            "warning"
+        );
 
     }
 
@@ -623,6 +832,8 @@ async function validateSession(){
 ========================================================== */
 
 function showLogin(){
+
+    document.body.classList.remove("portal-session-active");
 
     document
         .getElementById("loginPage")
@@ -650,10 +861,14 @@ function showLogin(){
 
 function afterLogin() {
 
+    document.body.classList.add("portal-session-active");
+
     document.getElementById("loginPage")?.classList.add("hidden");
     document.getElementById("appContainer")?.classList.remove("hidden");
 
     loadLoggedInUser();
+
+    loadAttendanceCounts();
 
     const role = normaliseRole(APP.user.role);
 
@@ -734,8 +949,10 @@ function renderRoleAvatar(avatar, role, userName){
 function profilePhotoDisplayUrl(value){
     const raw = String(value || "").trim();
     if (!raw) return "";
-    const driveId = (raw.match(/[?&]id=([A-Za-z0-9_-]+)/) || raw.match(/\/d\/([A-Za-z0-9_-]+)/) || [])[1];
-    const url = driveId ? "https://drive.google.com/uc?export=view&id=" + encodeURIComponent(driveId) : raw;
+    const driveId = (/^[A-Za-z0-9_-]{15,}$/.test(raw) ? raw : '') || (raw.match(/[?&]id=([A-Za-z0-9_-]+)/) || raw.match(/\/d\/([A-Za-z0-9_-]+)/) || [])[1];
+    // Thumbnail URLs render reliably inside an Apps Script iframe. `uc?export=view`
+    // is often blocked for uploaded Drive files even when the file is shared.
+    const url = driveId ? "https://drive.google.com/thumbnail?id=" + encodeURIComponent(driveId) + "&sz=w400" : raw;
     if (!/^https?:\/\//i.test(url)) return "";
     return url + (url.includes("?") ? "&" : "?") + "v=" + Date.now();
 }
@@ -881,7 +1098,7 @@ async function login() {
 
             APP.session = response.data.sessionId;
             APP.user = response.data;
-            sessionStorage.setItem("rtoSession", APP.session);
+            storePortalSession(APP.session);
 
             saveRememberedUser(username);
 
@@ -960,12 +1177,20 @@ async function logout(){
 
     APP.user = null;
 
-    sessionStorage.removeItem("rtoSession");
+    clearStoredPortalSession();
 
     hideLoader();
 
     showLogin();
 
+}
+
+function expireSessionSilently(){
+    APP.session = null;
+    APP.user = null;
+    clearStoredPortalSession();
+    hideLoader();
+    showLogin();
 }
 
 
@@ -1014,6 +1239,15 @@ function navigate(page, transitionClass){
     showPage(page, transitionClass);
 
     switch(page){
+        case "attendance":
+            loadAttendance();
+            break;
+        case "regularization":
+            loadAttendanceQueue();
+            break;
+        case "roster":
+            loadRosterPage();
+            break;
 
         case "riderDashboard":
 
@@ -1103,12 +1337,6 @@ function navigate(page, transitionClass){
 
 }
 
-function initializeRepository(){
-
-    $("#txtRepositorySearch")?.focus();
-    updateRepositoryExportButtons();
-
-}
 /* ==========================================================
    ROLE BASED MENUS
 ========================================================== */
@@ -1232,6 +1460,19 @@ async function loadRiderDashboard(){
 
         loadNotificationCount();
 
+        const isRider = normaliseRole(APP.user?.role) === "RIDER";
+        const attendancePanel = document.getElementById('attendanceDashboardPanel');
+        const switcher = document.getElementById('riderDashboardSwitcher');
+        if (attendancePanel) attendancePanel.classList.toggle('hidden', !isRider);
+        if (switcher) switcher.classList.toggle('hidden', !isRider);
+        if (isRider) {
+            bindRiderDashboardSwitcher();
+            setRiderDashboardView(APP.riderDashboardView || 'attendance');
+            loadAttendanceDashboard();
+        } else {
+            setRiderDashboardView('submissions');
+        }
+
     }
 
     catch(error){
@@ -1246,6 +1487,102 @@ async function loadRiderDashboard(){
 
     }
 
+}
+
+async function loadAttendanceDashboard() {
+    try {
+        const response = await server('attendanceDashboard');
+        if (!response?.success) throw new Error(response?.message || 'Unable to load attendance dashboard.');
+        const data = response.data || {}, put = (id, value) => { const element = document.getElementById(id); if (element) element.textContent = Number(value) || 0; };
+        put('attendanceDashboardPendingAttendance', data.pendingAttendance);
+        put('attendanceDashboardPendingKm', data.pendingKm);
+        put('attendanceDashboardApprovedAttendance', data.approvedAttendance);
+        put('attendanceDashboardApprovedKm', data.approvedKmRequests);
+        const body = document.getElementById('attendanceDashboardRecent'); if (!body) return;
+        const rows = data.recent || [];
+        body.innerHTML = rows.length ? rows.map(row => `<tr><td>${attendanceDisplayDate(row.attendance_date)}</td><td>${escapeHtml(row.request_type === 'KM' ? 'KM reading' : 'Attendance')}</td><td>${attendanceStatus(row.status)}</td><td>${escapeHtml(row.total_km) || '—'}</td></tr>`).join('') : '<tr><td colspan="4">No attendance activity yet.</td></tr>';
+        loadAttendanceCalendar();
+    } catch (error) { console.error(error); }
+}
+
+function bindRiderDashboardSwitcher() {
+    const switcher = document.getElementById('riderDashboardSwitcher');
+    if (!switcher || switcher.dataset.bound) return;
+    switcher.dataset.bound = 'yes';
+    switcher.querySelectorAll('[data-dashboard-view]').forEach(button => {
+        button.addEventListener('click', () => setRiderDashboardView(button.dataset.dashboardView));
+    });
+}
+
+function setRiderDashboardView(view) {
+    const isAttendance = view === 'attendance' && normaliseRole(APP.user?.role) === 'RIDER';
+    APP.riderDashboardView = isAttendance ? 'attendance' : 'submissions';
+    document.getElementById('attendanceDashboardPanel')?.classList.toggle('hidden', !isAttendance);
+    document.getElementById('submissionDashboardSection')?.classList.toggle('hidden', isAttendance);
+    document.querySelectorAll('#riderDashboardSwitcher [data-dashboard-view]').forEach(button => {
+        button.classList.toggle('active', button.dataset.dashboardView === APP.riderDashboardView);
+    });
+}
+
+function attendanceCalendarMonthKey(value) {
+    if (/^\d{4}-\d{2}$/.test(String(value || ''))) return value;
+    const today = new Date();
+    return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+}
+function attendanceCalendarLabel(month) {
+    const [year, number] = attendanceCalendarMonthKey(month).split('-').map(Number);
+    return new Date(year, number - 1, 1).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+}
+function attendanceCalendarMarkup(data) {
+    const days = data.days || [], riders = data.riders || [];
+    const header = days.map(day => `<th><span>${escapeHtml(day.weekday)}</span><strong>${day.day}</strong></th>`).join('');
+    const isTeamView = normaliseRole(APP.user?.role) !== 'RIDER';
+    const rows = riders.map(rider => {
+        const location = [rider.zone, rider.warehouse, rider.lmHub].filter(Boolean).join(' / ');
+        const riderDetail = isTeamView ? (location || rider.employeeId || rider.username) : (rider.employeeId || rider.username);
+        return `<tr><th class="attendance-calendar-rider"><strong>${escapeHtml(rider.riderName || rider.username)}</strong><small>${escapeHtml(riderDetail)}</small></th>${(rider.cells || []).map(cell => `<td><span class="attendance-calendar-cell ${String(cell.state || 'EMPTY').toLowerCase()}" title="${escapeHtml(cell.date)}: ${escapeHtml(cell.title || '')}">${escapeHtml(cell.label || '')}</span></td>`).join('')}</tr>`;
+    }).join('');
+    return `<table class="attendance-calendar-table"><thead><tr><th class="attendance-calendar-rider-head">Rider</th>${header}</tr></thead><tbody>${rows || `<tr><td colspan="${days.length + 1}" class="attendance-calendar-loading">No riders are available in your permitted scope.</td></tr>`}</tbody></table>`;
+}
+function renderAttendanceCalendar(data) {
+    const isRider = normaliseRole(APP.user?.role) === 'RIDER';
+    const target = document.getElementById(isRider ? 'riderAttendanceCalendar' : 'teamAttendanceCalendar');
+    if (!target) return;
+    data = data || {};
+    APP.attendanceCalendarMonth = data.month || attendanceCalendarMonthKey(APP.attendanceCalendarMonth);
+    const title = document.getElementById(isRider ? 'attendanceCalendarMonth' : 'teamAttendanceCalendarMonth');
+    if (title) title.textContent = attendanceCalendarLabel(APP.attendanceCalendarMonth);
+    target.innerHTML = attendanceCalendarMarkup(data);
+    if (!isRider) {
+        const cells = (data.riders || []).flatMap(rider => rider.cells || []);
+        const put = (id, count) => { const element = document.getElementById(id); if (element) element.textContent = count; };
+        put('teamAttendancePresent', cells.filter(cell => cell.state === 'PRESENT').length);
+        put('teamAttendancePending', cells.filter(cell => cell.state === 'PENDING').length);
+        put('teamAttendanceRejected', cells.filter(cell => ['REJECTED','ABSENT','LEAVE'].includes(cell.state)).length);
+        put('teamAttendanceRiders', (data.riders || []).length);
+    }
+}
+
+async function loadAttendanceCalendar(providedData) {
+    const isRider = normaliseRole(APP.user?.role) === 'RIDER';
+    const target = document.getElementById(isRider ? 'riderAttendanceCalendar' : 'teamAttendanceCalendar');
+    if (!target) return;
+    APP.attendanceCalendarMonth = attendanceCalendarMonthKey(APP.attendanceCalendarMonth);
+    if (providedData && typeof providedData === 'object') { renderAttendanceCalendar(providedData); return; }
+    target.innerHTML = '<div class="attendance-calendar-loading">Loading monthly attendance...</div>';
+    try {
+        const response = await server('attendanceCalendar', APP.attendanceCalendarMonth);
+        if (!response?.success) throw new Error(response?.message || 'Unable to load monthly attendance.');
+        renderAttendanceCalendar(response.data || {});
+    } catch (error) {
+        target.innerHTML = `<div class="attendance-calendar-loading">${escapeHtml(error.message || 'Unable to load monthly attendance.')}</div>`;
+    }
+}
+function changeAttendanceCalendarMonth(delta) {
+    const [year, month] = attendanceCalendarMonthKey(APP.attendanceCalendarMonth).split('-').map(Number);
+    const next = new Date(year, month - 1 + Number(delta || 0), 1);
+    APP.attendanceCalendarMonth = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}`;
+    loadAttendanceCalendar();
 }
 
 /* ==========================================================
@@ -1479,7 +1816,7 @@ setInterval(async()=>{
 
             );
 
-            logout();
+            expireSessionSilently();
 
         }
 
@@ -1491,7 +1828,7 @@ setInterval(async()=>{
 
     }
 
-},300000);
+},1800000);
 
 
 
@@ -3105,62 +3442,20 @@ async function openSubmission(submissionId){
 ========================================================== */
 
 async function loadPendingRequest(){
-
-    try{
-
-        const responses = await Promise.all([
-
-            server("pendingRequests"),
-
-            server("pendingLocationOptions")
-
-        ]);
-
-        const response = responses[0];
-
-        const locationResponse = responses[1];
-
-        if(!response.success){
-
-            showToast(
-
-                response.message,
-
-                "error"
-
-            );
-
+    try {
+        const response = await server("pendingWorkspace");
+        if (!response?.success) {
+            showToast(response?.message || "Unable to load pending requests.", "error");
             return;
-
         }
-
-        APP.pendingRequests = Array.isArray(response.data)
-            ? response.data
-            : [];
-
-        APP.pendingLocations = locationResponse.success &&
-            Array.isArray(locationResponse.data)
-                ? locationResponse.data
-                : [];
-
+        APP.pendingRequests = Array.isArray(response.data?.requests) ? response.data.requests : [];
+        APP.pendingLocations = Array.isArray(response.data?.locations) ? response.data.locations : [];
         populatePendingLocationFilters();
-
         applyPendingFilters();
-
+    } catch (error) {
+        console.error(error);
+        showToast(error.message || "Unable to load pending requests.", "error");
     }
-
-    catch(error){
-
-        showToast(
-
-            error.message,
-
-            "error"
-
-        );
-
-    }
-
 }
 
 
@@ -4361,89 +4656,6 @@ function openRepositoryDateRangeDialog() {
    ADMIN REPOSITORY
 ========================================================== */
 
-async function searchRepository(){
-
-    const type=
-
-        $("#ddlRepositorySearchType").value;
-
-    const value=
-
-        $("#txtRepositorySearch")
-
-        .value
-
-        .trim();
-
-    const dateRange = Object.assign({}, APP.repositoryDateRange || {});
-
-    if(!value){
-
-        showToast(
-
-            "Enter search value.",
-
-            "warning"
-
-        );
-
-        return;
-
-    }
-
-    try{
-
-        showLoader(
-            "Preparing your results...",
-            "Keep calm — your search results are being populated."
-        );
-
-        const response = type === "orderHistory"
-            ? await server("repositoryOrderHistory", value, dateRange)
-            : await server("repositorySearch", type, value, dateRange);
-
-        hideLoader();
-
-        if(!response.success){
-
-            showToast(
-
-                response.message,
-
-                "error"
-
-            );
-
-            return;
-
-        }
-
-        if (type === "orderHistory") {
-            renderRepositoryAudit(response.data);
-        } else {
-            renderRepository(response.data);
-        }
-
-    }
-
-    catch(error){
-
-        hideLoader();
-
-        showToast(
-
-            error.message,
-
-            "error"
-
-        );
-
-    }
-
-}
-
-
-
 function updateRepositoryExportButtons(){
 
     const hasResults = Array.isArray(APP.repositoryResults) &&
@@ -4454,38 +4666,6 @@ function updateRepositoryExportButtons(){
             const button = $("#" + id);
             if (button) button.disabled = !hasResults;
         });
-
-}
-
-function repositoryExportColumns(){
-
-    if (APP.repositoryResultMode === "audit") {
-        return [
-            ["Timestamp", "timestamp"],
-            ["Submission ID", "submissionId"],
-            ["Order Number", "orderNumber"],
-            ["Action", "action"],
-            ["Old Status", "oldStatus"],
-            ["New Status", "newStatus"],
-            ["Performed By", "performedBy"],
-            ["Role", "role"],
-            ["Remarks", "remarks"]
-        ];
-    }
-
-    return [
-        ["Submission ID", "submissionId"],
-        ["Submitted On", "timestamp"],
-        ["Order Number", "orderNumber"],
-        ["Rider Name", "riderName"],
-        ["Employee ID", "employeeId"],
-        ["Zone", "zone"],
-        ["Warehouse", "warehouse"],
-        ["LM Hub", "lmHub"],
-        ["Status", "status"],
-        ["Reviewed By", "reviewedBy"],
-        ["Reviewed On", "reviewedOn"]
-    ];
 
 }
 
@@ -4682,6 +4862,216 @@ function renderRepositoryAudit(data){
 }
 
 
+
+/* ==========================================================
+   ATTENDANCE
+========================================================== */
+function attendanceDateLimit() {
+    const type = document.getElementById("attendanceType")?.value || "ATTENDANCE";
+    const date = new Date(); date.setHours(0,0,0,0);
+    const daysBack = type === "KM" ? 2 : 1;
+    const field = document.getElementById("attendanceDate");
+    if (field) {
+        const selected = field.value;
+        field.innerHTML = "";
+        for (let offset = 0; offset <= daysBack; offset++) {
+            const allowed = new Date(date); allowed.setDate(allowed.getDate() - offset);
+            const value = allowed.getFullYear() + "-" + String(allowed.getMonth() + 1).padStart(2, "0") + "-" + String(allowed.getDate()).padStart(2, "0");
+            const label = allowed.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" }) + (offset === 0 ? " (Today)" : offset === 1 ? " (Yesterday)" : "");
+            const option = new Option(label, value);
+            if (value === selected || (!selected && offset === 0)) option.selected = true;
+            field.add(option);
+        }
+    }
+    document.querySelectorAll(".attendance-km").forEach(el => el.style.display = type === "KM" ? "block" : "none");
+}
+/* Enhanced attendance experience (definitions below supersede the legacy helpers above). */
+function attendanceStatus(value) { const text = escapeHtml(value || 'Pending'), state = String(value || '').toLowerCase(); return `<span class="attendance-status ${state}">${text}</span>`; }
+function bindAttendance() {
+    const form = document.getElementById('attendanceForm'), type = document.getElementById('attendanceType');
+    if (type && !type.dataset.attendanceBound) { type.dataset.attendanceBound = 'yes'; type.addEventListener('change', attendanceDateLimit); }
+    if (!form || form.dataset.attendanceBound) return;
+    form.dataset.attendanceBound = 'yes';
+    form.addEventListener('submit', async event => { event.preventDefault(); const button=form.querySelector('button[type="submit"]'); if(button) button.disabled=true; showLoader('Sending attendance request','Please wait while your request is sent for approval.'); try { const response=await server('attendanceSubmit',{type:document.getElementById('attendanceType').value,date:document.getElementById('attendanceDate').value,startKm:document.getElementById('attendanceStartKm').value,endKm:document.getElementById('attendanceEndKm').value}); if(!response?.success) throw new Error(response?.message||'Unable to submit attendance request.'); form.reset(); attendanceDateLimit(); await loadAttendance(); showToast(response.message||'Attendance request sent for approval.','success'); } catch(error) { showToast(error.message||'Unable to submit attendance request.','error'); } finally { hideLoader(); if(button) button.disabled=false; } });
+}
+async function loadAttendance() { bindAttendance(); attendanceDateLimit(); const body=document.getElementById('attendanceMyRows'); if(body) body.innerHTML='<tr><td colspan="7" class="attendance-empty">Loading requests…</td></tr>'; try { const response=await server('attendanceMine'); if(!response?.success) throw new Error(response?.message||'Unable to load attendance requests.'); attendanceRows(Array.isArray(response.data)?response.data:[],'attendanceMyRows',false); } catch(error) { if(body) body.innerHTML='<tr><td colspan="7" class="attendance-empty">Unable to load requests. Please refresh.</td></tr>'; showToast(error.message||'Unable to load attendance requests.','error'); } }
+function attendanceDecisionDialog(action) {
+  const container = document.getElementById('dialogContainer');
+  if (!container) return Promise.resolve({ confirmed: window.confirm(action + ' this request?'), remarks: '' });
+  const approving = String(action).toUpperCase() === 'APPROVED';
+  return new Promise(resolve => {
+    container.innerHTML = `
+      <div class="modal active attendance-decision-modal" role="dialog" aria-modal="true" aria-labelledby="attendanceDecisionTitle">
+        <div class="modal-content" role="document">
+          <div class="modal-header"><span id="attendanceDecisionTitle">${approving ? 'Approve attendance request' : 'Reject attendance request'}</span></div>
+          <div class="modal-body">
+            <p class="confirmation-message">${approving ? 'This will record the request as approved. KM values remain locked and can be changed only with Edit KM.' : 'The rider will be able to submit a new request for this work date after rejection.'}</p>
+            <label class="form-label" for="attendanceDecisionRemarks">Remarks <span class="form-optional">Optional</span></label>
+            <textarea id="attendanceDecisionRemarks" class="form-control attendance-decision-remarks" rows="3" maxlength="500" placeholder="Add a note for the rider"></textarea>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="secondary-btn" data-attendance-cancel>Cancel</button>
+            <button type="button" class="${approving ? 'primary-btn' : 'danger-btn'}" data-attendance-confirm>${approving ? 'Approve request' : 'Reject request'}</button>
+          </div>
+        </div>
+      </div>`;
+    const modal = container.querySelector('.attendance-decision-modal');
+    const remarks = container.querySelector('#attendanceDecisionRemarks');
+    const finish = result => { document.removeEventListener('keydown', onKey); container.innerHTML = ''; resolve(result); };
+    const onKey = event => { if (event.key === 'Escape') finish({ confirmed: false, remarks: '' }); };
+    container.querySelector('[data-attendance-cancel]')?.addEventListener('click', () => finish({ confirmed: false, remarks: '' }));
+    container.querySelector('[data-attendance-confirm]')?.addEventListener('click', () => finish({ confirmed: true, remarks: remarks?.value.trim() || '' }));
+    modal?.addEventListener('click', event => { if (event.target === modal) finish({ confirmed: false, remarks: '' }); });
+    document.addEventListener('keydown', onKey);
+    remarks?.focus();
+  });
+}
+async function attendanceAction(id, action) {
+  const decision = await attendanceDecisionDialog(action);
+  if (!decision.confirmed) return;
+  showLoader('Updating request','Please wait while the attendance request is updated.');
+  try { const response=await server('attendanceAction',id,action,decision.remarks); if(!response?.success)throw new Error(response?.message||'Unable to update request.'); showToast(response.message||'Updated.','success'); await loadAttendanceQueue(); }
+  catch(error) { showToast(error.message||'Unable to update request.','error'); }
+  finally { hideLoader(); }
+}
+async function loadAttendanceCounts() {
+    const regularization = document.getElementById('regularizationBadge');
+    const pending = document.getElementById('pendingRequestBadge');
+    if (!APP.user || !['HUB_MANAGER','ADMIN','SUPER_ADMIN'].includes(normaliseRole(APP.user.role))) return;
+    try {
+        const response = await server('navigationCounts');
+        const set = (element, count) => {
+            if (!element) return;
+            element.textContent = count > 999 ? '999+' : count;
+            element.classList.toggle('hidden', !count);
+            element.style.display = count ? 'inline-flex' : 'none';
+        };
+        if (response?.success) {
+            set(regularization, Number(response.data?.regularization || 0));
+            set(pending, Number(response.data?.pendingRequests || 0));
+        }
+    } catch (error) {
+        console.error(error);
+    }
+}
+setInterval(loadAttendanceCounts, 300000);
+async function bindZoneAdminEntry() { const card=document.getElementById('zoneAdminEntry'); if(!card||normaliseRole(APP.user?.role)!=='ADMIN'||String(APP.user?.access||'').toUpperCase()!=='ZONE')return; card.classList.add('visible'); const date=document.getElementById('zoneAdminDate'), today=new Date(); if(date){const min=new Date(today);min.setDate(min.getDate()-15);date.min=min.toISOString().slice(0,10);date.max=today.toISOString().slice(0,10);if(!date.value)date.value=date.max;} const rider=document.getElementById('zoneAdminRider'); if(rider&&!rider.dataset.loaded){const response=await server('attendanceRiderOptions');if(response?.success){rider.innerHTML='<option value="">Select rider</option>'+(response.data||[]).map(item=>`<option value="${escapeHtml(item.username)}">${escapeHtml(item.name)} · ${escapeHtml(item.employeeId)} · ${escapeHtml(item.warehouse)} / ${escapeHtml(item.lmHub)}</option>`).join('');rider.dataset.loaded='yes';}} const type=document.getElementById('zoneAdminType'),form=document.getElementById('zoneAdminAttendanceForm'); const toggle=()=>document.querySelectorAll('.zone-km').forEach(element=>element.style.display=type?.value==='KM'?'block':'none'); if(type&&!type.dataset.bound){type.dataset.bound='yes';type.addEventListener('change',toggle);}toggle();if(form&&!form.dataset.bound){form.dataset.bound='yes';form.addEventListener('submit',async event=>{event.preventDefault();showLoader('Saving approved entry','Please wait while the rider record is saved.');try{const response=await server('zoneAdminAttendanceEntry',{username:rider.value,type:type.value,date:date.value,startKm:document.getElementById('zoneAdminStartKm').value,endKm:document.getElementById('zoneAdminEndKm').value,remarks:document.getElementById('zoneAdminRemarks').value});if(!response?.success)throw new Error(response?.message||'Unable to save entry.');showToast(response.message,'success');form.reset();date.value=date.max;toggle();}catch(error){showToast(error.message||'Unable to save entry.','error');}finally{hideLoader();}});}}
+
+/* Final attendance renderers: do not use the browser's ambiguous MM/DD parser. */
+function attendanceDisplayDate(value) {
+    const raw = String(value || '').trim(); if (!raw) return '—';
+    const match = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+    if (match) return `${match[1].padStart(2,'0')}/${match[2].padStart(2,'0')}/${match[3]}${match[4] ? ` ${match[4].padStart(2,'0')}:${match[5]}:${(match[6] || '00').padStart(2,'0')}` : ''}`;
+    const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+    if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}${iso[4] ? ` ${iso[4]}:${iso[5]}:${iso[6] || '00'}` : ''}`;
+    return escapeHtml(raw);
+}
+function attendanceRows(rows, target, queue) {
+    const body = document.getElementById(target); if (!body) return;
+    if (!rows.length) { body.innerHTML = `<tr><td colspan="${queue ? 6 : 7}" class="${queue ? 'regularization-empty' : 'attendance-empty'}">No matching attendance requests.</td></tr>`; return; }
+    body.innerHTML = rows.map(r => queue ? `<tr><td><strong>${escapeHtml(r.rider_name)}</strong><br><small>${escapeHtml(r.employee_id)}</small></td><td>${attendanceDisplayDate(r.attendance_date)}</td><td>${escapeHtml(r.request_type === 'KM' ? 'KM reading' : 'Attendance')}</td><td>${r.request_type === 'KM' ? `${escapeHtml(r.start_km)} – ${escapeHtml(r.end_km)}<br><small>Total: ${escapeHtml(r.total_km)} KM</small>` : '—'}</td><td>${attendanceDisplayDate(r.submitted_on)}</td><td><button class="primary-btn regularization-action" onclick="attendanceAction('${r.request_id}','Approved')">Approve</button><button class="secondary-btn regularization-action" onclick="attendanceAction('${r.request_id}','Rejected')">Reject</button></td></tr>` : `<tr><td>${attendanceDisplayDate(r.attendance_date)}</td><td>${escapeHtml(r.request_type === 'KM' ? 'KM reading' : 'Attendance')}</td><td>${escapeHtml(r.start_km) || '—'}</td><td>${escapeHtml(r.end_km) || '—'}</td><td>${escapeHtml(r.total_km) || '—'}</td><td>${attendanceStatus(r.status)}</td><td>${attendanceDisplayDate(r.submitted_on)}</td></tr>`).join('');
+}
+async function loadApprovedKm(providedRows) {
+    const list = document.getElementById('approvedKmList');
+    if (!list) return;
+    try {
+        let rows = providedRows;
+        if (!Array.isArray(rows)) {
+            const response = await server('attendanceApprovedKm');
+            if (!response?.success) throw new Error(response?.message || 'Unable to load approved KM records.');
+            rows = response.data || [];
+        }
+        list.innerHTML = rows.length ? rows.map(row => `<div class="km-edit-item"><strong>${escapeHtml(row.rider_name)}</strong><small>${attendanceDisplayDate(row.attendance_date)} - ${escapeHtml(row.start_km)} to ${escapeHtml(row.end_km)} - ${escapeHtml(row.total_km)} KM</small><button class="secondary-btn" onclick="editApprovedKm('${row.request_id}','${escapeHtml(row.start_km)}','${escapeHtml(row.end_km)}')">Edit KM</button></div>`).join('') : '<div class="regularization-empty">No approved KM records in your scope.</div>';
+    } catch (error) {
+        list.innerHTML = '<div class="regularization-empty">Unable to load approved KM records.</div>';
+        showToast(error.message || 'Unable to load approved KM records.', 'error');
+    }
+}
+async function loadLeaveQueue(providedRows) {
+    const body = document.getElementById('leaveQueueRows');
+    if (!body) return;
+    try {
+        let rows = providedRows;
+        if (!Array.isArray(rows)) {
+            const response = await server('leaveQueue');
+            if (!response?.success) throw new Error(response?.message || 'Unable to load leave requests.');
+            rows = response.data || [];
+        }
+        body.innerHTML = rows.length ? rows.map(row => `<tr><td><strong>${escapeHtml(row.rider_name)}</strong><br><small>${escapeHtml(row.employee_id)}</small></td><td>${attendanceDisplayDate(row.leave_date)}</td><td>${escapeHtml(row.reason)}</td><td><button class="primary-btn regularization-action" onclick="leaveAction('${row.leave_id}','Approved')">Approve</button><button class="secondary-btn regularization-action" onclick="leaveAction('${row.leave_id}','Rejected')">Reject</button></td></tr>`).join('') : '<tr><td colspan="4" class="regularization-empty">No unpaid leave requests pending.</td></tr>';
+    } catch (error) {
+        body.innerHTML = '<tr><td colspan="4" class="regularization-empty">Unable to load unpaid leave requests.</td></tr>';
+    }
+}
+async function leaveAction(id,action){const approved=await confirmAction({title:action==='Approved'?'Approve unpaid leave':'Reject unpaid leave',message:action==='Approved'?'Approve this unpaid leave request?':'Reject this unpaid leave request?',confirmText:action==='Approved'?'Approve request':'Reject request'});if(!approved)return;showLoader('Updating leave request','Please wait while the request is updated.');try{const response=await server('leaveAction',id,action);if(!response?.success)throw new Error(response?.message||'Unable to update leave request.');showToast(response.message,'success');loadLeaveQueue();}catch(error){showToast(error.message||'Unable to update leave request.','error');}finally{hideLoader();}}
+function editKmDialog(currentStart,currentEnd){const container=document.getElementById('dialogContainer');if(!container)return Promise.resolve(null);return new Promise(resolve=>{container.innerHTML=`<div class="modal active km-edit-modal" role="dialog" aria-modal="true" aria-labelledby="kmEditTitle"><div class="modal-content" role="document"><div class="modal-header"><span id="kmEditTitle">Edit approved KM</span></div><div class="modal-body"><p class="confirmation-message">Correct the rider's approved kilometre reading. The total is calculated automatically.</p><div class="km-edit-form"><label>Start KM<input id="kmEditStart" class="form-control" type="number" min="0" step="1" value="${escapeHtml(currentStart)}"></label><label>End KM<input id="kmEditEnd" class="form-control" type="number" min="0" step="1" value="${escapeHtml(currentEnd)}"></label></div><p id="kmEditError" class="km-edit-error hidden"></p></div><div class="modal-footer"><button type="button" class="secondary-btn" data-km-edit-cancel>Cancel</button><button type="button" class="primary-btn" data-km-edit-save>Save KM changes</button></div></div></div>`;const start=container.querySelector('#kmEditStart'),end=container.querySelector('#kmEditEnd'),error=container.querySelector('#kmEditError'),modal=container.querySelector('.km-edit-modal');const finish=value=>{document.removeEventListener('keydown',onKey);container.innerHTML='';resolve(value);};const onKey=event=>{if(event.key==='Escape')finish(null);};container.querySelector('[data-km-edit-cancel]')?.addEventListener('click',()=>finish(null));container.querySelector('[data-km-edit-save]')?.addEventListener('click',()=>{const startValue=Number(start.value),endValue=Number(end.value);if(!Number.isFinite(startValue)||!Number.isFinite(endValue)||startValue<0||endValue<startValue){error.textContent='Enter valid KM values. End KM must be greater than or equal to Start KM.';error.classList.remove('hidden');return;}finish({start:startValue,end:endValue});});modal?.addEventListener('click',event=>{if(event.target===modal)finish(null);});document.addEventListener('keydown',onKey);start?.focus();});}
+async function editApprovedKm(id, currentStart, currentEnd) {
+    const km = await editKmDialog(currentStart,currentEnd); if (!km) return;
+    showLoader('Updating approved KM', 'Please wait while the kilometre record is corrected.');
+    try { const response = await server('attendanceEditKm', id, km.start, km.end, 'Edited from Regularization'); if (!response?.success) throw new Error(response?.message || 'Unable to update KM.'); showToast(response.message || 'Approved KM record updated.', 'success'); await loadApprovedKm(); } catch(error) { showToast(error.message || 'Unable to update KM.', 'error'); } finally { hideLoader(); }
+}
+async function bindAttendanceCorrection(){const card=document.getElementById('attendanceCorrectionCard'),form=document.getElementById('attendanceCorrectionForm'),rider=document.getElementById('attendanceCorrectionRider'),date=document.getElementById('attendanceCorrectionDate');if(!card||!form||!rider||!date)return;const role=normaliseRole(APP.user?.role);if(!['HUB_MANAGER','ADMIN','SUPER_ADMIN'].includes(role)){card.classList.add('hidden');return;}const today=new Date(),iso=today.toISOString().slice(0,10);date.max=iso;if(role!=='SUPER_ADMIN'){const min=new Date(today);min.setDate(min.getDate()-2);date.min=min.toISOString().slice(0,10);}else date.removeAttribute('min');if(!date.value)date.value=iso;if(!rider.dataset.loaded){try{const response=await server('attendanceCorrectionRiders');if(!response?.success)throw new Error(response?.message||'Unable to load riders.');rider.innerHTML='<option value="">Select rider</option>'+(response.data||[]).map(item=>`<option value="${escapeHtml(item.username)}">${escapeHtml(item.name)} · ${escapeHtml(item.employeeId)} · ${escapeHtml(item.warehouse)} / ${escapeHtml(item.lmHub)}</option>`).join('');rider.dataset.loaded='yes';}catch(error){showToast(error.message||'Unable to load riders.','error');}}if(form.dataset.bound)return;form.dataset.bound='yes';form.addEventListener('submit',async event=>{event.preventDefault();showLoader('Saving attendance correction','Checking your role, scope, and permitted correction date.');try{const response=await server('attendanceCorrection',{username:rider.value,date:date.value,state:document.getElementById('attendanceCorrectionState').value,remarks:document.getElementById('attendanceCorrectionRemarks').value});if(!response?.success)throw new Error(response?.message||'Unable to save attendance correction.');showToast(response.message||'Attendance corrected.','success');document.getElementById('attendanceCorrectionRemarks').value='';await loadAttendanceCalendar();}catch(error){showToast(error.message||'Unable to save attendance correction.','error');}finally{hideLoader();}});}
+async function loadAttendanceQueue() {
+    const body = document.getElementById('attendanceQueueRows');
+    if (body) body.innerHTML = '<tr><td colspan="6" class="regularization-empty">Loading pending requests...</td></tr>';
+    try {
+        const response = await server('attendanceWorkspace', APP.attendanceCalendarMonth);
+        if (!response?.success) throw new Error(response?.message || 'Unable to load regularization workspace.');
+        const workspace = response.data || {};
+        const search = (document.getElementById('regularizationSearch')?.value || '').toLowerCase().trim();
+        const from = document.getElementById('regularizationFrom')?.value || '';
+        const to = document.getElementById('regularizationTo')?.value || '';
+        const rows = (workspace.queue || []).filter(item =>
+            (!search || String(item.rider_name || '').toLowerCase().includes(search) || String(item.employee_id || '').toLowerCase().includes(search)) &&
+            (!from || String(item.attendance_date_iso || '') >= from) &&
+            (!to || String(item.attendance_date_iso || '') <= to)
+        );
+        attendanceRows(rows, 'attendanceQueueRows', true);
+        const count = document.getElementById('regularizationResultCount');
+        if (count) count.textContent = `${rows.length} pending request${rows.length === 1 ? '' : 's'}`;
+        const badge = document.getElementById('regularizationBadge');
+        const pendingCount = Number(workspace.counts?.regularization || 0);
+        if (badge) { badge.textContent = pendingCount > 999 ? '999+' : pendingCount; badge.classList.toggle('hidden', !pendingCount); badge.style.display = pendingCount ? 'inline-flex' : 'none'; }
+        bindZoneAdminEntry();
+        bindAttendanceCorrection();
+        loadApprovedKm(workspace.approvedKm || []);
+        loadLeaveQueue(workspace.leaveQueue || []);
+        loadAttendanceCalendar(workspace.calendar || {});
+    } catch (error) {
+        if (body) body.innerHTML = '<tr><td colspan="6" class="regularization-empty">Unable to load requests. Please refresh.</td></tr>';
+        showToast(error.message || 'Unable to load regularization workspace.', 'error');
+    }
+}
+
+/* Attendance repository.  Server-side scope checks prevent cross-zone exports. */
+function attendanceRepositoryFilters() { return { term:document.getElementById('attendanceRepositoryTerm')?.value.trim()||'', zone:document.getElementById('attendanceRepositoryZone')?.value||'', warehouse:document.getElementById('attendanceRepositoryWarehouse')?.value||'', lmHub:document.getElementById('attendanceRepositoryHub')?.value||'', vendor:document.getElementById('attendanceRepositoryVendor')?.value||'', from:(APP.repositoryDateRange||{}).start||'', to:(APP.repositoryDateRange||{}).end||'' }; }
+function repositoryOption(select, values, placeholder) { if(!select)return; const selected=select.value; select.innerHTML=`<option value="">${placeholder}</option>`+[...new Set(values.filter(Boolean))].sort().map(value=>`<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join(''); if([...select.options].some(option=>option.value===selected))select.value=selected; }
+async function loadAttendanceRepositoryOptions() { try { const response=await server('attendanceRepository',{}); if(!response?.success) throw new Error(response?.message||'Unable to load attendance filters.'); const rows=response.data||[]; repositoryOption(document.getElementById('attendanceRepositoryZone'),rows.map(row=>row.zone),'All permitted zones'); repositoryOption(document.getElementById('attendanceRepositoryWarehouse'),rows.map(row=>row.warehouse),'All permitted warehouses'); repositoryOption(document.getElementById('attendanceRepositoryHub'),rows.map(row=>row.lm_hub),'All permitted LM Hubs'); repositoryOption(document.getElementById('attendanceRepositoryVendor'),rows.map(row=>row.vendor_name),'All permitted vendors'); } catch(error) { showToast(error.message||'Unable to load attendance filters.','error'); } }
+function toggleAttendanceRepository() { const attendance=document.getElementById('ddlRepositorySearchType')?.value==='attendance'; document.getElementById('attendanceRepositoryFilters')?.classList.toggle('hidden',!attendance); document.getElementById('repositorySearchValueGroup')?.classList.toggle('hidden',attendance); if(attendance)loadAttendanceRepositoryOptions(); }
+function renderAttendanceRepository(rows) { APP.repositoryResults=Array.isArray(rows)?rows:[]; APP.repositoryResultMode='attendance'; updateRepositoryExportButtons(); document.getElementById('repositoryResultsCard')?.classList.add('hidden'); document.getElementById('repositoryAuditCard')?.classList.add('hidden'); document.getElementById('attendanceRepositoryCard')?.classList.remove('hidden'); const body=document.getElementById('attendanceRepositoryTableBody'); if(!body)return; if(!APP.repositoryResults.length){body.innerHTML='<tr><td colspan="12" style="text-align:center;padding:28px">No attendance records match the selected filters.</td></tr>';return;} body.innerHTML=APP.repositoryResults.map(row=>`<tr><td>${attendanceDisplayDate(row.attendance_date)}</td><td>${escapeHtml(row.rider_name)}</td><td>${escapeHtml(row.employee_id)}</td><td>${escapeHtml(row.zone)}</td><td>${escapeHtml(row.warehouse)}</td><td>${escapeHtml(row.lm_hub)}</td><td>${escapeHtml(row.request_type==='KM'?'KM reading':'Attendance')}</td><td>${escapeHtml(row.start_km)||'—'}</td><td>${escapeHtml(row.end_km)||'—'}</td><td>${escapeHtml(row.total_km)||'—'}</td><td>${attendanceStatus(row.status)}</td><td>${escapeHtml(row.actioned_by)||'—'}</td></tr>`).join(''); }
+async function searchRepository() { const type=document.getElementById('ddlRepositorySearchType')?.value, value=document.getElementById('txtRepositorySearch')?.value.trim()||'', dateRange=Object.assign({},APP.repositoryDateRange||{}); if(type==='attendance'){showLoader('Preparing attendance repository','Loading only records within your authorised scope.');try{const response=await server('attendanceRepository',attendanceRepositoryFilters());if(!response?.success)throw new Error(response?.message||'Unable to search attendance repository.');renderAttendanceRepository(response.data||[]);}catch(error){showToast(error.message||'Unable to search attendance repository.','error');}finally{hideLoader();}return;} if(!value){showToast('Enter search value.','warning');return;} showLoader('Preparing your results...','Please wait while your search results are populated.');try{const response=type==='orderHistory'?await server('repositoryOrderHistory',value,dateRange):await server('repositorySearch',type,value,dateRange);if(!response?.success)throw new Error(response.message);document.getElementById('attendanceRepositoryCard')?.classList.add('hidden');if(type==='orderHistory')renderRepositoryAudit(response.data);else renderRepository(response.data);}catch(error){showToast(error.message||'Unable to run repository search.','error');}finally{hideLoader();} }
+function repositoryExportColumns() { if(APP.repositoryResultMode==='attendance')return [['Work Date','attendance_date'],['Rider Name','rider_name'],['Employee ID','employee_id'],['Zone','zone'],['Warehouse','warehouse'],['LM Hub','lm_hub'],['Request Type','request_type'],['Start KM','start_km'],['End KM','end_km'],['Total KM','total_km'],['Status','status'],['Actioned By','actioned_by']]; if(APP.repositoryResultMode==='audit')return [['Timestamp','timestamp'],['Submission ID','submissionId'],['Order Number','orderNumber'],['Action','action'],['Old Status','oldStatus'],['New Status','newStatus'],['Performed By','performedBy'],['Role','role'],['Remarks','remarks']]; return [['Submission ID','submissionId'],['Submitted On','timestamp'],['Order Number','orderNumber'],['Rider Name','riderName'],['Employee ID','employeeId'],['Zone','zone'],['Warehouse','warehouse'],['LM Hub','lmHub'],['Status','status'],['Reviewed By','reviewedBy'],['Reviewed On','reviewedOn']]; }
+function initializeRepository() { document.getElementById('txtRepositorySearch')?.focus(); updateRepositoryExportButtons(); const selector=document.getElementById('ddlRepositorySearchType'); if(selector&&!selector.dataset.attendanceBound){selector.dataset.attendanceBound='yes';selector.addEventListener('change',toggleAttendanceRepository);} toggleAttendanceRepository(); }
+
+/* Roster and unpaid leave. CSV headers: Username, Date, Shift, Week Off. */
+function rosterDate(value) { return attendanceDisplayDate(value); }
+async function loadRoster() {
+    const body=document.getElementById('rosterVerticalView'); if(!body)return; body.innerHTML='<div class="roster-empty">Loading roster…</div>';
+    try { const response=await server('rosterList',document.getElementById('rosterFrom')?.value||'',document.getElementById('rosterTo')?.value||''); if(!response?.success)throw new Error(response?.message||'Unable to load roster.'); const rows=response.data||[]; APP.rosterRows=rows; body.innerHTML=renderVerticalRoster(rows); } catch(error){body.innerHTML='<div class="roster-empty">Unable to load roster.</div>';showToast(error.message||'Unable to load roster.','error');}
+}
+function rosterShiftCode(value){const shift=String(value||'').trim().toLowerCase();if(shift==='n'||shift.startsWith('night'))return'N';if(shift==='a'||shift.startsWith('afternoon'))return'A';return'M';}
+function rosterCalendarDates(rows){const from=document.getElementById('rosterFrom')?.value||'',to=document.getElementById('rosterTo')?.value||'';if(from&&to&&from<=to){const dates=[],cursor=new Date(`${from}T12:00:00`),end=new Date(`${to}T12:00:00`);while(cursor<=end&&dates.length<93){dates.push([cursor.getFullYear(),String(cursor.getMonth()+1).padStart(2,'0'),String(cursor.getDate()).padStart(2,'0')].join('-'));cursor.setDate(cursor.getDate()+1);}return dates;}return [...new Set(rows.map(row=>row.date_iso||row.roster_date).filter(Boolean))].sort();}
+function rosterCalendarDateLabel(value){const match=String(value||'').match(/^(\d{4})-(\d{2})-(\d{2})$/);if(!match)return{weekday:'',day:rosterDate(value)};const date=new Date(Number(match[1]),Number(match[2])-1,Number(match[3]));return{weekday:date.toLocaleDateString('en-IN',{weekday:'short'}),day:String(Number(match[3]))};}
+function rosterChip(row){const weekoff=String(row.week_off||'').toLowerCase()==='yes';return `<span class="roster-rider-chip${weekoff?' weekoff':''}"><strong>${escapeHtml(row.rider_name||row.username)}</strong> · ${escapeHtml(row.employee_id||'')} ${weekoff?'· Week off':''}</span>`;}
+function renderVerticalRoster(rows){if(!rows.length)return'<div class="roster-empty">No roster records are available for this period.</div>';const dates=rosterCalendarDates(rows),riders={};rows.forEach(row=>{const id=String(row.username||row.employee_id||row.rider_name||'').toLowerCase();if(!id)return;if(!riders[id])riders[id]={...row,cells:{}};riders[id].cells[row.date_iso||row.roster_date]=row;});const header=dates.map(date=>{const label=rosterCalendarDateLabel(date);return `<th><span>${escapeHtml(label.weekday)}</span><strong>${escapeHtml(label.day)}</strong></th>`;}).join('');const riderRows=Object.values(riders).sort((a,b)=>String(a.rider_name||a.username).localeCompare(String(b.rider_name||b.username))).map(rider=>{const location=[rider.zone,rider.warehouse,rider.lm_hub].filter(Boolean).join(' / ');const cells=dates.map(date=>{const row=rider.cells[date];if(!row)return `<td><span class="roster-calendar-cell empty" title="${escapeHtml(date)}: No roster"></span></td>`;const weekOff=String(row.week_off||'').toLowerCase()==='yes',code=rosterShiftCode(row.shift),label=weekOff?'Week off':({M:'Morning',A:'Afternoon',N:'Night'}[code]+' shift');return `<td><span class="roster-calendar-cell ${weekOff?'weekoff':`shift-${code.toLowerCase()}`}" title="${escapeHtml(date)}: ${escapeHtml(label)}">${weekOff?'W':code}</span></td>`;}).join('');return `<tr><th class="roster-calendar-rider"><strong>${escapeHtml(rider.rider_name||rider.username)}</strong><small>${escapeHtml(location||rider.employee_id||'')}</small></th>${cells}</tr>`;}).join('');return `<div class="roster-calendar-scroll"><table class="roster-calendar-table"><thead><tr><th class="roster-calendar-rider-head">Rider</th>${header}</tr></thead><tbody>${riderRows}</tbody></table></div><div class="roster-calendar-legend"><span><i class="roster-key morning"></i>M · Morning</span><span><i class="roster-key afternoon"></i>A · Afternoon</span><span><i class="roster-key night"></i>N · Night</span><span><i class="roster-key weekoff"></i>W · Week off</span></div>`;}
+function csvCell(value){const text=String(value??'');return /[",\n]/.test(text)?'"'+text.replace(/"/g,'""')+'"':text;}
+async function downloadPermittedRoster(){showLoader('Preparing roster download','Creating a CSV for your permitted rider scope.');try{const response=await server('rosterList',document.getElementById('rosterFrom')?.value||'',document.getElementById('rosterTo')?.value||'');if(!response?.success)throw new Error(response?.message||'Unable to download roster.');const rows=response.data||[];if(!rows.length){showToast('There are no roster records to download for this date range.','warning');return;}const csv=[['Date','Username','Rider Name','Employee ID','Shift','Week Off','Zone','Warehouse','LM Hub'],...rows.map(row=>[rosterDate(row.date_iso||row.roster_date),row.username,row.rider_name,row.employee_id,row.shift,row.week_off,row.zone,row.warehouse,row.lm_hub])].map(row=>row.map(csvCell).join(',')).join('\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='permitted-roster.csv';document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(url);showToast('Roster download is ready.','success');}catch(error){showToast(error.message||'Unable to download roster.','error');}finally{hideLoader();}}
+async function loadMyLeaves(){const body=document.getElementById('leaveRows');if(!body)return;try{const response=await server('myLeaveRequests');if(!response?.success)throw new Error(response?.message||'Unable to load leave requests.');const rows=response.data||[];body.innerHTML=rows.length?rows.map(row=>`<tr><td>${rosterDate(row.leave_date)}</td><td>Unpaid</td><td>${escapeHtml(row.reason)}</td><td>${attendanceStatus(row.status)}</td></tr>`).join(''):'<tr><td colspan="4">No leave requests yet.</td></tr>';}catch(error){body.innerHTML='<tr><td colspan="4">Unable to load leave requests.</td></tr>';}}
+function csvRows(text){const lines=String(text||'').split(/\r?\n/).filter(line=>line.trim()&&!line.trim().startsWith('#'));if(lines.length<2)throw new Error('The CSV must contain a header row and at least one roster row.');const headers=lines.shift().split(',').map(value=>value.trim().toLowerCase().replace(/[^a-z]/g,''));const index=name=>headers.indexOf(name);if(index('date')<0||(index('username')<0&&index('ridername')<0))throw new Error('CSV must include Date and either Username or Rider Name.');return lines.map((line,indexNumber)=>{const cells=line.split(',').map(value=>value.trim());return {rowNumber:indexNumber+2,username:index('username')>=0?cells[index('username')]:'',riderName:index('ridername')>=0?cells[index('ridername')]:'',date:cells[index('date')],shift:index('shift')>=0?cells[index('shift')]:'General',weekOff:index('weekoff')>=0?cells[index('weekoff')]:'No'};});}
+function downloadRosterTemplate(){const csv='Username,Rider Name,Date,Shift,Week Off\n# Date formats accepted: 01-Aug-2026 (recommended), 1-Aug-26, 01-08-26, 1-8-26, 01-08-2026, 1-8-2026\n';const blob=new Blob([csv],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='rider-roster-template.csv';document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(url);}
+function renderRosterUploadReport(data){const report=document.getElementById('rosterUploadReport');if(!report)return;const skipped=Array.isArray(data?.skipped)?data.skipped:[];report.classList.remove('hidden');report.innerHTML=`<strong>${escapeHtml(data?.message||'Roster upload complete.')}</strong>${skipped.length?`<div class="roster-upload-skipped"><span>Skipped rows</span><ul>${skipped.map(item=>`<li>Row ${escapeHtml(item.row)} — ${escapeHtml(item.rider)}: ${escapeHtml(item.reason)}</li>`).join('')}</ul></div>`:'<span class="roster-upload-success">All rows were within your permitted scope.</span>'}`;}
+async function uploadRosterCsv(){const file=document.getElementById('rosterCsvFile')?.files?.[0];if(!file){showToast('Select a roster CSV file first.','warning');return;}document.getElementById('rosterUploadReport')?.classList.add('hidden');showLoader('Uploading roster','Checking every row against your authorised rider scope.');try{const text=await file.text(),rows=csvRows(text),response=await server('uploadRoster',rows);if(!response?.success)throw new Error(response?.message||'Unable to upload roster.');renderRosterUploadReport(response);showToast(response.message||'Roster upload complete.',Number(response.saved)>0?'success':'warning');document.getElementById('rosterCsvFile').value='';loadRoster();}catch(error){showToast(error.message||'Unable to upload roster.','error');}finally{hideLoader();}}
+function bindLeaveForm(){const form=document.getElementById('unpaidLeaveForm');if(!form||form.dataset.bound)return;form.dataset.bound='yes';form.addEventListener('submit',async event=>{event.preventDefault();showLoader('Sending unpaid leave request','Please wait while your leave request is submitted.');try{const response=await server('applyUnpaidLeave',{date:document.getElementById('unpaidLeaveDate').value,reason:document.getElementById('unpaidLeaveReason').value});if(!response?.success)throw new Error(response?.message||'Unable to submit leave request.');showToast(response.message||'Leave request sent.','success');form.reset();loadMyLeaves();}catch(error){showToast(error.message||'Unable to submit leave request.','error');}finally{hideLoader();}});}
+async function loadRosterPage(){const manager=['HUB_MANAGER','ADMIN','SUPER_ADMIN'].includes(normaliseRole(APP.user?.role));document.getElementById('rosterUploadCard')?.classList.toggle('visible',manager);document.getElementById('leaveCard')?.classList.toggle('hidden',normaliseRole(APP.user?.role)!=='RIDER');bindLeaveForm();await loadRoster();if(normaliseRole(APP.user?.role)==='RIDER')loadMyLeaves();}
 
 /* ==========================================================
    NOTIFICATIONS
@@ -5823,6 +6213,7 @@ function applyAppBranding() {
         element.textContent = config.version ? "Version " + config.version : "";
     });
     document.querySelectorAll("[data-app-logo]").forEach(image => {
+        image.onerror = function () { this.style.display = "none"; this.closest(".sidebar-logo, .loader-box")?.classList.add("logo-unavailable"); };
         if (config.logoUrl) image.src = config.logoUrl;
     });
 
