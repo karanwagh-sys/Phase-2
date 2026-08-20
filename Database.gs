@@ -271,11 +271,22 @@ function objects(name) {
     const entries = Object.keys(fieldValues || {})
       .filter(key => COL[key] !== undefined);
 
+    if (!entries.length) return;
+
+    // A status update commonly changes several adjacent columns. Writing each
+    // field separately creates one Sheets network call per value. Read the row
+    // once, merge the requested fields in memory, and write it back once.
+    const sh = sheet(name);
+    const width = sh.getLastColumn();
+    const values = sh.getRange(row, 1, 1, width).getValues()[0];
+
     entries.forEach(key => {
-      sheet(name).getRange(row, COL[key] + 1).setValue(fieldValues[key]);
+      values[COL[key]] = fieldValues[key];
     });
 
-    if (entries.length) refresh(name);
+    sh.getRange(row, 1, 1, width).setValues([values]);
+
+    refresh(name);
 
   }
 
@@ -541,6 +552,10 @@ function objects(name) {
     return {
 
       list,
+
+      // Backward-compatible alias used by the attendance and roster modules.
+      // Keep this while those modules are deployed so legacy calls do not fail.
+      all: list,
 
       find,
 
