@@ -303,6 +303,20 @@ const API = (() => {
 
     if (action === "login") return Auth.login(args[0], args[1]);
 
+    // This contains display-only values used by the separately hosted PWA.
+    // It intentionally returns no sheet IDs, secrets, user data or session data.
+    if (action === "externalBootstrap") {
+      return Utility.success(SUCCESS.FETCHED, {
+        name: Utility.safeString(Config.get("APP_NAME")),
+        version: Utility.safeString(Config.get("APP_VERSION")),
+        company: Utility.safeString(Config.get("COMPANY_NAME")),
+        logoUrl: Utility.safeString(Config.get("APP_LOGO_URL")),
+        themeColor: Utility.safeString(Config.get("APP_THEME_COLOR")),
+        darkModeEnabled: Utility.safeString(Config.get("ENABLE_DARK_MODE")).toLowerCase() === "yes",
+        translationEnabled: Utility.safeString(Config.get("ENABLE_TRANSLATION")).toLowerCase() === "yes"
+      });
+    }
+
     if (action === "validateSession") {
       const user = requireSession(sessionId);
       return user
@@ -331,6 +345,83 @@ const API = (() => {
 
       case "updateManagedUser":
         return UserManagement.update(user, args[0], args[1]);
+
+      case "attendanceMine":
+        return Utility.success(SUCCESS.FETCHED, Attendance.mine(user));
+
+      case "attendanceDashboard":
+        return Utility.success(SUCCESS.FETCHED, Attendance.riderDashboard(user));
+
+      case "attendanceCalendar":
+        return Utility.success(SUCCESS.FETCHED, Attendance.attendanceCalendar(user, args[0]));
+
+      case "attendanceCorrectionRiders":
+        return Utility.success(SUCCESS.FETCHED, Attendance.correctionRiderOptions(user));
+
+      case "attendanceCorrection":
+        return Attendance.correctAttendance(user, args[0] || {});
+
+      case "attendanceSubmit":
+        return Attendance.submit(user, args[0] || {});
+
+      case "attendanceQueue":
+        return Utility.success(SUCCESS.FETCHED, Attendance.queue(user));
+
+      case "attendanceApprovedKm":
+        return Utility.success(SUCCESS.FETCHED, Attendance.approvedKm(user));
+
+      case "attendanceAction":
+        return Attendance.act(user, args[0], args[1], args[2]);
+
+      case "attendanceEditKm":
+        return Attendance.editKm(user, args[0], args[1], args[2], args[3]);
+
+      case "attendanceCounts":
+        return Utility.success(SUCCESS.FETCHED, Attendance.counts(user));
+
+      case "attendanceWorkspace":
+        return Utility.success(SUCCESS.FETCHED, Attendance.workspace(user, args[0]));
+
+      case "attendanceRepository":
+        return Utility.success(SUCCESS.FETCHED, Attendance.repository(user, args[0] || {}));
+
+      case "attendanceRiderOptions":
+        return Utility.success(SUCCESS.FETCHED, Attendance.riderOptions(user));
+
+      case "pendingQueueCount": {
+        const error = accessError(user, isManager);
+        return error || Utility.success(SUCCESS.FETCHED, pendingRecordsForUser(user).length);
+      }
+
+      case "navigationCounts": {
+        const error = accessError(user, isManager);
+        if (error) return error;
+        return Utility.success(SUCCESS.FETCHED, {
+          regularization: Attendance.counts(user).regularization,
+          pendingRequests: pendingRecordsForUser(user).length
+        });
+      }
+
+      case "zoneAdminAttendanceEntry":
+        return Attendance.zoneAdminEntry(user, args[0] || {});
+
+      case "rosterList":
+        return Utility.success(SUCCESS.FETCHED, Roster.list(user, args[0], args[1]));
+
+      case "uploadRoster":
+        return Roster.upload(user, args[0] || []);
+
+      case "myLeaveRequests":
+        return Utility.success(SUCCESS.FETCHED, Roster.myLeaves(user));
+
+      case "applyUnpaidLeave":
+        return Roster.applyLeave(user, args[0] || {});
+
+      case "leaveQueue":
+        return Utility.success(SUCCESS.FETCHED, Roster.leaveQueue(user));
+
+      case "leaveAction":
+        return Roster.actionLeave(user, args[0], args[1]);
 
       case "createSubmission": {
         const data = args[0] && typeof args[0] === "object" ? args[0] : {};
@@ -383,6 +474,17 @@ const API = (() => {
       case "pendingLocationOptions": {
         const error = accessError(user, isManager);
         return error || Utility.success(SUCCESS.FETCHED, Config.locations());
+      }
+
+      case "pendingWorkspace": {
+        const error = accessError(user, isManager);
+        if (error) return error;
+        const records = pendingRecordsForUser(user).map(submissionDto);
+        return Utility.success(SUCCESS.FETCHED, {
+          requests: records,
+          locations: Config.locations(),
+          count: records.length
+        });
       }
 
       case "claimReview": {
