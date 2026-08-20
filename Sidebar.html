@@ -27,7 +27,10 @@
     <button type="button" class="menu-item active rtoOnly" id="menuDashboard" data-page="riderDashboard"><span>&#128202;</span><span>Dashboard</span></button>
     <button type="button" class="menu-item rtoOnly" id="menuSubmission" data-page="riderSubmission"><span>&#128230;</span><span>New Submission</span></button>
     <button type="button" class="menu-item rtoOnly" id="menuMySubmissions" data-page="mySubmission"><span>&#128203;</span><span>My Submissions</span></button>
-    <button type="button" class="menu-item managerOnly rtoOnly" id="menuPending" data-page="pendingRequest" data-rto-roles="HUB_MANAGER,ADMIN,SUPER_ADMIN" hidden><span>&#9203;</span><span>Pending Requests</span></button>
+    <button type="button" class="menu-item rtoOnly" id="menuAttendance" data-page="attendance" data-rto-roles="RIDER" hidden><span>&#128197;</span><span>Attendance</span></button>
+    <button type="button" class="menu-item managerOnly rtoOnly" id="menuRegularization" data-page="regularization" data-rto-roles="HUB_MANAGER,ADMIN,SUPER_ADMIN" hidden><span>&#9989;</span><span>Regularization</span><span id="regularizationBadge" class="badge hidden">0</span></button>
+    <button type="button" class="menu-item rtoOnly" id="menuRoster" data-page="roster" title="View roster or upload a team roster"><span>&#128197;</span><span>Roster &amp; Leave</span><span class="menu-tag">Upload</span></button>
+    <button type="button" class="menu-item managerOnly rtoOnly" id="menuPending" data-page="pendingRequest" data-rto-roles="HUB_MANAGER,ADMIN,SUPER_ADMIN" hidden><span>&#9203;</span><span>Pending Requests</span><span id="pendingRequestBadge" class="badge hidden">0</span></button>
     <button type="button" class="menu-item managerOnly rtoOnly" id="menuReview" data-page="reviewRequest" data-rto-roles="HUB_MANAGER,ADMIN,SUPER_ADMIN" hidden><span>&#9989;</span><span>Review Requests</span></button>
     <button type="button" class="menu-item adminOnly rtoOnly" id="menuAdmin" data-page="adminDashboard" data-rto-roles="ADMIN,SUPER_ADMIN" hidden><span>&#128188;</span><span>Admin Dashboard</span></button>
     <button type="button" class="menu-item adminOnly rtoOnly" id="menuRepository" data-page="adminRepository" data-rto-roles="ADMIN,SUPER_ADMIN" hidden><span>&#128218;</span><span>Repository</span></button>
