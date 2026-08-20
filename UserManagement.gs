@@ -15,7 +15,7 @@ const UserManagement = (() => {
     'Warehouse', 'LM Hub', 'Status', 'Failed Attempts', 'Locked',
     'Role', 'Access Scope', 'Session ID', 'Last Login',
     'Registered Email', 'User Photo', 'Created / Edited By',
-    'Creation / Edit Date and Time'
+    'Creation / Edit Date and Time', 'Vendor Name'
   ];
 
   function text(value) {
@@ -150,6 +150,7 @@ const UserManagement = (() => {
           sessionId: text(cell(row, headerInfo.map, 'Session ID')),
           lastLogin: cell(row, headerInfo.map, 'Last Login'),
           email: text(cell(row, headerInfo.map, 'Registered Email')),
+          vendorName: text(cell(row, headerInfo.map, 'Vendor Name')),
           userPhoto: text(cell(row, headerInfo.map, 'User Photo')),
           editedBy: text(cell(row, headerInfo.map, 'Created / Edited By')),
           editedAt: cell(row, headerInfo.map, 'Creation / Edit Date and Time')
@@ -187,6 +188,13 @@ const UserManagement = (() => {
       });
   }
 
+  function vendorNames() {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG_SHEET);
+    if (!sheet || sheet.getLastRow() < 2) return [];
+    const values = sheet.getRange(2, 12, sheet.getLastRow() - 1, 1).getDisplayValues().map(row => text(row[0])).filter(Boolean);
+    return values.filter((value, index) => values.findIndex(item => item.toLowerCase() === value.toLowerCase()) === index);
+  }
+
   function same(left, right) {
     return text(left).toLowerCase() === text(right).toLowerCase();
   }
@@ -199,7 +207,7 @@ const UserManagement = (() => {
     }
     if (actor.role === 'ADMIN') {
       if (actor.access === 'CSR') return ['CALLING_AGENT'];
-      if (actor.access === 'WAREHOUSE') return ['RIDER', 'HUB_MANAGER'];
+      if (actor.access === 'WAREHOUSE') return ['RIDER', 'HUB_MANAGER', 'ADMIN'];
       if (actor.access === 'ZONE') return ['RIDER', 'HUB_MANAGER', 'ADMIN'];
     }
     if (actor.role === 'HUB_MANAGER' && actor.access === 'LM_HUB') return ['RIDER'];
@@ -269,6 +277,7 @@ const UserManagement = (() => {
       role: roleLabel(record.role),
       access: scopeLabel(record.access),
       email: record.email,
+      vendorName: record.vendorName,
       userPhoto: record.userPhoto
     };
   }
@@ -289,6 +298,7 @@ const UserManagement = (() => {
       },
       roles: allowedRoleKeys(currentActor).map(roleLabel),
       locations: permittedLocations(currentActor),
+      vendors: vendorNames(),
       users: data.records.filter((record) => canManage(currentActor, record)).map(publicUser),
       takenUsernames: data.records.map((record) => record.username),
       takenEmployeeIds: data.records.map((record) => record.employeeId)
@@ -329,6 +339,7 @@ const UserManagement = (() => {
       lmHub: text(input.lmHub),
       status: text(input.status) || 'Active',
       email: text(input.email),
+      vendorName: text(input.vendorName),
       password: text(input.password),
       photo: input.photo || input.userPhoto || null
     };
@@ -339,6 +350,7 @@ const UserManagement = (() => {
     if (!input.riderName) throw new Error('Rider / Calling Agent Name is required.');
     if (!input.employeeId) throw new Error('Employee ID is required.');
     if (!input.role) throw new Error('Role is required.');
+    if (input.role === 'RIDER' && !input.vendorName) throw new Error('Vendor Name is required for a Rider.');
     if (!input.zone || !input.warehouse || !input.lmHub) {
       throw new Error('Zone, Warehouse and LM Hub are required.');
     }
@@ -409,6 +421,7 @@ const UserManagement = (() => {
     put('Role', roleLabel(input.role));
     put('Access Scope', scopeLabel(input.access));
     put('Registered Email', input.email);
+    put('Vendor Name', input.vendorName);
     put('Created / Edited By', actor.username || actor.name || 'System');
     put('Creation / Edit Date and Time', new Date());
     return { values: values, put: put };
