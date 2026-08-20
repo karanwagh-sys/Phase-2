@@ -58,17 +58,17 @@ const Auth = (() => {
   }
 
   function sessionDurationMs() {
-    const minutes = Number(Config.get("SESSION_TIMEOUT_MIN"));
-
-    if (!isFinite(minutes) || minutes < 1)
-      throw new Error("Configuration setting 'SESSION_TIMEOUT_MIN' must be a positive number.");
-
-    return minutes * 60 * 1000;
+    // Attendance operations may take time; all portal sessions are intentionally 10 hours.
+    return 10 * 60 * 60 * 1000;
 
   }
 
   function sessionKey(id) {
     return SESSION_PREFIX + Utility.safeString(id);
+  }
+
+  function sessionUserKey(id) {
+    return sessionKey(id) + ".user";
   }
   function canonicalRole(value) {
     const role = Utility.safeString(value).trim();
@@ -103,22 +103,32 @@ const Auth = (() => {
   }
 
 
-  function storeSession(id, username) {
+  function storeSession(id, username, userData) {
 
-    PropertiesService.getScriptProperties().setProperty(
-      sessionKey(id),
-      JSON.stringify({
+    const key = sessionKey(id);
+    const payload = JSON.stringify({
         username: Utility.safeString(username),
         expiresAt: Date.now() + sessionDurationMs()
-      })
-    );
+      });
+
+    PropertiesService.getScriptProperties().setProperty(key, payload);
+    CacheService.getScriptCache().put(key, payload, 300);
+    if (userData) {
+      CacheService.getScriptCache().put(
+        sessionUserKey(id),
+        JSON.stringify(userData),
+        30
+      );
+    }
 
   }
 
   function readSession(id) {
 
     const key = sessionKey(id);
-    const raw = PropertiesService.getScriptProperties().getProperty(key);
+    const cache = CacheService.getScriptCache();
+    const properties = PropertiesService.getScriptProperties();
+    const raw = cache.get(key) || properties.getProperty(key);
 
     if (!raw) return null;
 
@@ -126,13 +136,21 @@ const Auth = (() => {
       const session = JSON.parse(raw);
 
       if (!session.expiresAt || Number(session.expiresAt) <= Date.now()) {
-        PropertiesService.getScriptProperties().deleteProperty(key);
+        cache.remove(key);
+        cache.remove(sessionUserKey(id));
+        properties.deleteProperty(key);
         return null;
       }
 
+      // A short cache avoids repeated Script Properties reads during a page
+      // load while PropertiesService remains the durable 10-hour store.
+      cache.put(key, raw, 300);
+
       return session;
     } catch (error) {
-      PropertiesService.getScriptProperties().deleteProperty(key);
+      cache.remove(key);
+      cache.remove(sessionUserKey(id));
+      properties.deleteProperty(key);
       return null;
     }
 
@@ -140,8 +158,12 @@ const Auth = (() => {
 
   function deleteSession(id) {
 
-    if (Utility.safeString(id))
-      PropertiesService.getScriptProperties().deleteProperty(sessionKey(id));
+    if (Utility.safeString(id)) {
+      const key = sessionKey(id);
+      CacheService.getScriptCache().remove(key);
+      CacheService.getScriptCache().remove(sessionUserKey(id));
+      PropertiesService.getScriptProperties().deleteProperty(key);
+    }
 
   }
 
@@ -222,7 +244,7 @@ function login(username, password) {
       id
     );
 
-    storeSession(id, data.USERNAME);
+    storeSession(id, data.USERNAME, data);
 
     return Utility.success(
       SUCCESS.LOGIN,
@@ -284,6 +306,14 @@ function login(username, password) {
     if (!session)
       return null;
 
+    // A page opens several independent Apps Script executions at once. Reuse
+    // the already-validated user briefly so those calls do not each rescan the
+    // User Master sheet. The short TTL still rechecks status and lock changes.
+    const cachedUser = CacheService.getScriptCache().get(sessionUserKey(sessionId));
+    if (cachedUser) {
+      try { return JSON.parse(cachedUser); } catch (error) {}
+    }
+
     const user = Database.users.findBySession(sessionId);
 
     if (!user)
@@ -304,6 +334,12 @@ function login(username, password) {
       return null;
 
     }
+
+    CacheService.getScriptCache().put(
+      sessionUserKey(sessionId),
+      JSON.stringify(user.data),
+      30
+    );
 
     return user.data;
 
