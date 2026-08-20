@@ -88,7 +88,8 @@
     if (target === 'ADMIN') {
       if (actorRole === 'SUPER_ADMIN' && actorScope === 'PAN INDIA') return ['Zone', 'Warehouse', 'CSR'];
       if (actorRole === 'SUPER_ADMIN' && actorScope === 'CSR') return ['CSR'];
-      if (actorRole === 'ADMIN' && actorScope === 'ZONE') return ['Zone'];
+      if (actorRole === 'ADMIN' && actorScope === 'ZONE') return ['Zone', 'Warehouse'];
+      if (actorRole === 'ADMIN' && actorScope === 'WAREHOUSE') return ['Warehouse'];
     }
     return [];
   }
@@ -131,10 +132,11 @@
     var context = state.context || {}, original = norm(value('managedOriginalUsername'));
     var username = value('managedUsername'), employeeId = value('managedEmployeeId');
     var usernameTaken = (context.takenUsernames || []).some(function (u) { return norm(u) === norm(username) && norm(u) !== original; });
-    var employeeTaken = (context.takenEmployeeIds || []).some(function (e, i) {
-      if (norm(e) !== norm(employeeId)) return false;
-      var matchingUser = (context.allUsers || [])[i];
-      return !matchingUser || norm(matchingUser.username) !== original;
+    /* While editing, the current user's own Employee ID is valid.  The
+       previous index-based comparison used a list that was not returned to
+       the browser, so every existing Employee ID was incorrectly flagged. */
+    var employeeTaken = state.users.some(function (user) {
+      return norm(user.employeeId) === norm(employeeId) && norm(user.username) !== original;
     });
     var uNote = $('managedUsernameAvailability'), eNote = $('managedEmployeeIdAvailability');
     if (uNote) {
@@ -161,6 +163,7 @@
     $('managedPassword').required = true;
     $('managedPasswordLabel').innerHTML = 'Initial Access Code <span class="required">*</span>';
     selectOptions('managedRole', (state.context || {}).roles || [], 'Select role', '');
+    selectOptions('managedVendor', (state.context || {}).vendors || [], 'Select vendor', '');
     configureAccess('');
     refreshLocations('', '', '');
     setAvailability();
@@ -177,6 +180,7 @@
     $('managedStatus').value = user.status || 'Active';
     refreshLocations(user.zone, user.warehouse, user.lmHub);
     $('managedEmail').value = user.email || '';
+    if ($('managedVendor')) $('managedVendor').value = user.vendorName || '';
     $('managedPhoto').value = '';
     $('managedPassword').value = '';
     $('managedPassword').required = false;
@@ -212,7 +216,7 @@
       username: value('managedUsername') || value('managedOriginalUsername'),
       riderName: value('managedName'), employeeId: value('managedEmployeeId'), role: value('managedRole'),
       access: value('managedAccess'), status: value('managedStatus'), zone: value('managedZone'),
-      warehouse: value('managedWarehouse'), lmHub: value('managedHub'), email: value('managedEmail'),
+      warehouse: value('managedWarehouse'), lmHub: value('managedHub'), email: value('managedEmail'), vendorName: value('managedVendor'),
       password: value('managedPassword'), photo: photo
     };
   }
@@ -239,7 +243,7 @@
     state.bound = true;
     $('managedUserForm').addEventListener('submit', submit, true);
     $('managedCancel').addEventListener('click', function (event) { event.preventDefault(); event.stopImmediatePropagation(); resetForm(); }, true);
-    $('managedRole').addEventListener('change', function () { configureAccess(''); });
+    $('managedRole').addEventListener('change', function () { configureAccess(''); var rider = roleKey(value('managedRole')) === 'RIDER'; $('managedVendor').required = rider; });
     $('managedZone').addEventListener('change', function () { refreshLocations(value('managedZone'), '', ''); });
     $('managedWarehouse').addEventListener('change', function () { refreshLocations(value('managedZone'), value('managedWarehouse'), ''); });
     $('managedUsername').addEventListener('input', checkAvailabilitySoon);
@@ -261,10 +265,6 @@
   window.resetManagedUserForm = resetForm;
   function start() {
     bind(); showUserManagementMenu();
-    window.setInterval(function () {
-      showUserManagementMenu();
-      if (pageVisible() && !state.loaded && !state.loading) loadContext();
-    }, 400);
     if (pageVisible()) loadContext();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
